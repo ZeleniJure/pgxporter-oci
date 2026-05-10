@@ -9,7 +9,12 @@ scrape_configs:
     static_configs:
       - targets: [pgxporter:9187]
         labels:
-          instance: local-pg17
+          instance: local-pg17-primary
+          role: primary
+      - targets: [pgxporter-replica:9187]
+        labels:
+          instance: local-pg17-replica
+          role: replica
 
   - job_name: prometheus
     static_configs:

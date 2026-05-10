@@ -54,16 +54,48 @@ just nuke       # stop + drop volumes (fresh DB next time)
 
 Endpoints once the stack is up:
 
-| Service    | URL                                      | Notes |
-| ---------- | ---------------------------------------- | ----- |
-| Exporter   | <http://localhost:9187/metrics>          | also `/healthz` |
-| Prometheus | <http://localhost:9090>                  | scrapes the exporter every 15s |
-| Grafana    | <http://localhost:3000>                  | anonymous Admin, login form disabled |
-| Postgres   | `localhost:5432`                         | user `exporter` / pass `exporter` / db `appdb` |
+| Service             | URL                                      | Notes |
+| ------------------- | ---------------------------------------- | ----- |
+| Exporter (primary)  | <http://localhost:9187/metrics>          | also `/healthz` |
+| Exporter (replica)  | <http://localhost:9188/metrics>          | scrapes the standby |
+| Prometheus          | <http://localhost:9090>                  | scrapes both exporters every 15s |
+| Grafana             | <http://localhost:3000>                  | anonymous Admin, login form disabled |
+| Postgres (primary)  | `localhost:5432`                         | user `exporter` / pass `exporter` / db `appdb` |
+| Postgres (replica)  | `localhost:5433`                         | streaming standby, read-only |
 
 In the compose stack `pgxporter` runs in **password mode** (`PGX_PASSWORD` is
 set), so no AWS credentials are needed. The `exporter` Postgres role is
 created by `local/init.sql` with `pg_monitor` membership.
+
+### Replica & load generator
+
+The stack ships with a streaming physical replica and an opt-in workload
+generator so the dashboards aren't a wall of zeros:
+
+- `postgres-replica` runs `pg_basebackup` against the primary on first boot
+  (using the `replicator` role and the `replica1` physical slot created in
+  `local/init.sql`) and then streams WAL via the standard walreceiver. It
+  exposes 5433 on the host. A second exporter, `pgxporter-replica`, scrapes
+  it on `:9188`. Prometheus tags the two with `role={primary,replica}` and
+  `instance={local-pg17-primary,local-pg17-replica}`.
+  - Sanity check: `just psql-replica` then
+    `SELECT pg_is_in_recovery();` (`t`),
+    `SELECT * FROM pg_stat_wal_receiver;` (one row).
+  - On the primary: `SELECT application_name, state, sync_state,
+    pg_wal_lsn_diff(sent_lsn, replay_lsn) AS lag_bytes
+    FROM pg_stat_replication;`.
+
+- `pgpoke` runs always-on and fires one trivial read-only query per second
+  (`SELECT 1`, `SELECT count(*) FROM demo.widgets`, `SELECT now()`) so a
+  fresh `just up` doesn't show flatlined-at-zero dashboards. It's
+  deliberately tiny — no writes, no data growth, no measurable CPU/IO.
+
+- `just load` brings up the `pgbench` service (compose profile `load`),
+  which runs `pgbench -c 4 -j 2 -T 0` against `appdb` *and* a parallel
+  psql loop hammering `demo.widgets` with mixed SELECT/INSERT/UPDATE/DELETE.
+  This lights up `pg_stat_database`, `pg_stat_user_tables`,
+  `pg_stat_bgwriter`, WAL/checkpoint counters and `pg_stat_statements`.
+  Stop it with `just load-stop`; the rest of the stack keeps running.
 
 ### Inner loops
 

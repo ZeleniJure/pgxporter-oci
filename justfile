@@ -13,13 +13,18 @@ set shell := ["bash", "-cu"]
 default:
     @just --list
 
-# Build images and start the full stack (postgres + exporter + prometheus + grafana).
+# Build images and start the full stack (postgres + replica + exporter x2 + prometheus + grafana).
 up:
     docker compose up -d --build
     @echo
-    @echo "  pgxporter   http://localhost:9187/metrics"
-    @echo "  prometheus  http://localhost:9090"
-    @echo "  grafana     http://localhost:3000"
+    @echo "  pgxporter (primary)  http://localhost:9187/metrics"
+    @echo "  pgxporter (replica)  http://localhost:9188/metrics"
+    @echo "  prometheus           http://localhost:9090"
+    @echo "  grafana              http://localhost:3000"
+    @echo
+    @echo "  primary psql:  just psql           (localhost:5432)"
+    @echo "  replica psql:  just psql-replica   (localhost:5433, read-only)"
+    @echo "  load gen:      just load           (pgbench + demo.widgets)"
 
 # Stop the stack, keep volumes.
 down:
@@ -53,6 +58,24 @@ run:
 # Open an interactive psql shell inside the postgres container as the superuser.
 psql:
     docker compose exec postgres psql -U postgres -d appdb
+
+# Open an interactive psql shell against the replica (read-only). Useful for
+# confirming standby state, e.g. `SELECT pg_is_in_recovery();` or
+# `SELECT * FROM pg_stat_wal_receiver;`.
+psql-replica:
+    docker compose exec postgres-replica psql -U postgres -d appdb
+
+# Start the synthetic workload generator (pgbench + demo.widgets loop).
+# Profile-gated so it doesn't run by default. Tail its output with
+# `just logs pgbench`.
+load:
+    docker compose --profile load up -d pgbench
+    @echo "loadgen running. stop it with 'just load-stop', tail with 'just logs pgbench'."
+
+# Stop the workload generator without tearing down the rest of the stack.
+load-stop:
+    docker compose stop pgbench
+    docker compose rm -f pgbench
 
 # Run a single SQL query and print the result. Quote the whole query.
 #   just sql "SHOW shared_preload_libraries;"

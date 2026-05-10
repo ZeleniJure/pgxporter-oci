@@ -22,16 +22,57 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: appdb
+    # `wal_level=replica`, `hot_standby=on`, and the wal-sender/slot limits
+    # are PG17 defaults, so we only need to opt into pg_stat_statements
+    # (otherwise the CREATE EXTENSION in init.sql is silently inert and the
+    # exporter's statement metrics stay empty).
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Numbered so pg_hba is patched before init.sql runs (alphabetical order).
+      - ./local/pg_hba.sh:/docker-entrypoint-initdb.d/00-pg_hba.sh:ro
       - ./local/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
       interval: 2s
       timeout: 3s
       retries: 20
+
+  # Streaming physical replica. On first boot PGDATA is empty, so the
+  # entrypoint runs `pg_basebackup -R` against the primary, attaches to the
+  # `replica1` slot created by init.sql, then hands off to the normal
+  # postgres entrypoint. Subsequent boots see a populated PGDATA and skip
+  # straight to `exec docker-entrypoint.sh postgres`.
+  postgres-replica:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # docker-entrypoint.sh insists on POSTGRES_PASSWORD existing even when
+      # PGDATA is already initialized; it's never actually used here.
+      POSTGRES_PASSWORD: postgres
+      PGUSER: postgres
+    entrypoint:
+      - /bin/bash
+      - /replica-entrypoint.sh
+    volumes:
+      - pgdata-replica:/var/lib/postgresql/data
+      - ./local/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   pgxporter:
     build:
@@ -51,6 +92,68 @@ services:
       LISTEN_ADDR: ":9187"
     ports:
       - "9187:9187"
+
+  pgxporter-replica:
+    build:
+      context: .
+      args:
+        VERSION: dev
+        GIT_SHA: local
+    depends_on:
+      postgres-replica:
+        condition: service_healthy
+    environment:
+      PGX_HOST: postgres-replica
+      PGX_PORT: "5432"
+      PGX_USER: exporter
+      PGX_PASSWORD: exporter
+      PGX_DB: appdb
+      LISTEN_ADDR: ":9187"
+    ports:
+      - "9188:9187"
+
+  # Always-on idle ticker: one trivial read-only query per second so the
+  # dashboards on a fresh `just up` show *something* moving (xact_commit,
+  # tup_returned, a couple of pg_stat_statements rows) instead of being
+  # uniformly flatlined at zero. Costs effectively nothing. For real
+  # workload-shaped traffic, use `just load` (the pgbench service below).
+  pgpoke:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: appdb
+    entrypoint: ["/bin/bash", "/pgpoke.sh"]
+    volumes:
+      - ./local/pgpoke.sh:/pgpoke.sh:ro
+    restart: unless-stopped
+
+  # Synthetic workload generator. Profile-gated so `just up` stays light;
+  # bring it up with `just load`. Combines pgbench (TPC-B-ish OLTP, drives
+  # bgwriter/WAL/checkpoint counters) with a custom psql loop that hits a
+  # `demo.widgets` table so pg_stat_user_tables and pg_stat_statements show
+  # recognizable application-shaped queries rather than just pgbench's.
+  pgbench:
+    image: postgres:17-alpine
+    profiles: ["load"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: appdb
+    entrypoint: ["/bin/bash", "/loadgen.sh"]
+    volumes:
+      - ./local/loadgen.sh:/loadgen.sh:ro
+    restart: unless-stopped
 
   prometheus:
     image: prom/prometheus:latest
@@ -84,5 +187,6 @@ services:
 
 volumes:
   pgdata:
+  pgdata-replica:
   promdata:
   grafanadata:
