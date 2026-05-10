@@ -1,0 +1,132 @@
+name: build-and-release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=pr,prefix=pr-
+            type=sha,prefix=sha-
+            type=sha,format=long,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine previous tag
+        id: prev
+        run: |
+          current="${GITHUB_REF_NAME}"
+          prev=$(git tag --list 'v*' --sort=-v:refname | grep -v "^${current}\$" | head -n1 || true)
+          echo "current=${current}" >> "$GITHUB_OUTPUT"
+          echo "previous=${prev}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release notes
+        run: |
+          current="${{ steps.prev.outputs.current }}"
+          previous="${{ steps.prev.outputs.previous }}"
+          repo_url="${{ github.server_url }}/${{ github.repository }}"
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          version="${current#v}"
+
+          {
+            echo "## Container image"
+            echo ""
+            echo "\`${image}:${version}\`"
+            echo ""
+            echo "Pull:"
+            echo ""
+            echo "\`\`\`sh"
+            echo "docker pull ${image}:${version}"
+            echo "\`\`\`"
+            echo ""
+            if [ -n "$previous" ]; then
+              echo "## Changes since [\`${previous}\`](${repo_url}/releases/tag/${previous})"
+              echo ""
+              echo "[Full diff](${repo_url}/compare/${previous}...${current})"
+              echo ""
+              echo "### Commits"
+              echo ""
+              git log --pretty=format:'- %s ([`%h`]('"${repo_url}"'/commit/%H)) — %an' "${previous}..${current}"
+              echo ""
+            else
+              echo "## Initial release"
+              echo ""
+              echo "### Commits"
+              echo ""
+              git log --pretty=format:'- %s ([`%h`]('"${repo_url}"'/commit/%H)) — %an' "${current}"
+              echo ""
+            fi
+          } > release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.prev.outputs.current }}
+          name: ${{ steps.prev.outputs.current }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(steps.prev.outputs.current, '-') }}

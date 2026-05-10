@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    env: local
+
+scrape_configs:
+  - job_name: pgxporter
+    static_configs:
+      - targets: [pgxporter:9187]
+        labels:
+          instance: local-pg17
+
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]

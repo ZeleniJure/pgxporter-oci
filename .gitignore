@@ -1,0 +1,10 @@
+# Build artifacts
+/bin/
+/dist/
+
+# Local env overrides
+.env
+
+# Editor
+.vscode/
+.idea/

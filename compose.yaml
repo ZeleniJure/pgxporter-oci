@@ -1,0 +1,88 @@
+# Local development stack for pgxporter-oci.
+#
+# Brings up Postgres, the exporter (built from this repo), Prometheus
+# scraping it, and Grafana with Prometheus pre-provisioned as a datasource.
+#
+#   just up        # build + start everything
+#   just down      # stop
+#   just nuke      # stop + drop volumes (fresh DB next time)
+#
+# Endpoints:
+#   pgxporter   http://localhost:9187/metrics
+#   prometheus  http://localhost:9090
+#   grafana     http://localhost:3000   (anonymous admin)
+#   postgres    localhost:5432  user=exporter pass=exporter db=appdb
+
+name: pgxporter-oci
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./local/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  pgxporter:
+    build:
+      context: .
+      args:
+        VERSION: dev
+        GIT_SHA: local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGX_HOST: postgres
+      PGX_PORT: "5432"
+      PGX_USER: exporter
+      PGX_PASSWORD: exporter
+      PGX_DB: appdb
+      LISTEN_ADDR: ":9187"
+    ports:
+      - "9187:9187"
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - pgxporter
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./local/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+    volumes:
+      - ./local/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./local/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:
+  promdata:
+  grafanadata:
