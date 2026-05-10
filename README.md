@@ -18,6 +18,8 @@ Environment variables (no flags, no config file):
 | `AWS_REGION` | conditional |      | Required in IAM mode (when `PGX_PASSWORD` is empty). Used for SigV4 token signing. |
 | `LISTEN_ADDR`| no       | `:9187` | |
 | `PGX_METRIC_PREFIX` | no | `pg_stat` | Metric namespace. `pg_stat` (default) — native pgxporter / modern PostgreSQL view names (`pg_stat_database_*`, `pg_stat_bgwriter_*`, …), matching the bundled Grafana dashboards. `pg` — drop-in compatibility with community `postgres_exporter` dashboards (`pg_database_*`, `pg_bgwriter_*`, …). |
+| `PGX_ENABLE_COLLECTORS`  | no |     | Comma-separated. If set, restricts the running collector set to exactly these names; overrides the default-enabled set. Use to opt into collectors that are off by default (`statements`, `settings`, `subscription`) without pulling every other collector along. |
+| `PGX_DISABLE_COLLECTORS` | no |     | Comma-separated. Subtracted from the resolved collector set after `PGX_ENABLE_COLLECTORS`, so a name in both lists ends up disabled. Use on managed Postgres flavours that hide certain views (see [Managed Postgres / Aurora](#managed-postgres--aurora) below). Unknown names are logged and ignored — a typo on deploy won't take the exporter down. |
 
 Auth mode is chosen at startup and logged (`auth mode: password` or
 `auth mode: rds-iam`). In IAM mode the container picks up AWS credentials from
@@ -35,6 +37,49 @@ unchanged.
 `PoolMaxConnLifetime` is 14 minutes — RDS IAM tokens are valid 15 minutes, so
 pgxpool rotates connections one minute before expiry and every fresh
 connection gets a freshly minted token.
+
+### Collectors
+
+The full collector list lives in the upstream
+[`exporter/collectors`](https://pkg.go.dev/github.com/becomeliminal/pgxporter/exporter/collectors)
+package. As of `v1.0.0-rc2`:
+
+```
+activity, archiver, bgwriter, checkpointer, database, database_size,
+io, io_user_indexes, io_user_tables, locks,
+progress_analyze, progress_basebackup, progress_cluster, progress_copy,
+progress_create_index, progress_vacuum,
+replication, replication_slots, settings, slru, ssl, statements,
+subscription, user_indexes, user_tables, wal, wal_receiver
+```
+
+Default-on is everything **except** `settings`, `statements`,
+`subscription` (high cardinality / niche / expensive).
+
+#### Managed Postgres / Aurora
+
+Managed flavours often restrict access to certain system views and the
+exporter will log a per-scrape error for each one. Disable them
+explicitly to keep logs clean:
+
+```bash
+# Aurora writer (typical):
+PGX_DISABLE_COLLECTORS=wal_receiver,slru,subscription
+
+# Aurora reader (no replication state at all):
+PGX_DISABLE_COLLECTORS=wal_receiver,slru,subscription,replication,replication_slots
+```
+
+`PGX_ENABLE_COLLECTORS` is the inverse knob — pin the running set to
+exactly the listed names, e.g. opt into `statements` without enabling
+`settings`:
+
+```bash
+PGX_ENABLE_COLLECTORS=database,database_size,activity,bgwriter,wal,statements
+```
+
+If both are set, `PGX_DISABLE_COLLECTORS` wins for any name in both
+lists.
 
 ## Local development
 

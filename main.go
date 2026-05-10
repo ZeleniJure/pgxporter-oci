@@ -28,6 +28,21 @@
 //     PGX_METRIC_PREFIX  — "pg_stat" (default, native pgxporter / modern names
 //     matching the bundled Grafana dashboards) or "pg"
 //     (postgres_exporter-compat: pg_database_*, pg_bgwriter_*, …)
+//     PGX_ENABLE_COLLECTORS  — optional, comma-separated. If set, restricts the
+//     running collector set to exactly these names; overrides the default-
+//     enabled set. Use to opt into collectors that are off by default
+//     (e.g. "statements", "settings", "subscription") without pulling in
+//     every other collector.
+//     PGX_DISABLE_COLLECTORS — optional, comma-separated. Subtracted from the
+//     resolved collector set after PGX_ENABLE_COLLECTORS, so a name in
+//     both lists ends up disabled. Use on managed Postgres flavours that
+//     restrict access to certain views — Aurora notably hides
+//     pg_stat_wal_receiver, pg_stat_replication on the writer, the SLRU
+//     view, and a few others; setting e.g.
+//     PGX_DISABLE_COLLECTORS=wal_receiver,slru,subscription silences the
+//     resulting scrape errors. Unknown names are logged and ignored.
+//     See https://pkg.go.dev/github.com/becomeliminal/pgxporter/exporter/collectors
+//     for the full list of collector names.
 package main
 
 import (
@@ -73,6 +88,13 @@ func main() {
 		log.Error("invalid PGX_METRIC_PREFIX", "err", err)
 		os.Exit(2)
 	}
+	// Collector enable/disable lists are optional. Validation (unknown
+	// names) happens inside collectors.ResolveCollectors, which logs and
+	// ignores unknown entries rather than aborting — typo-on-deploy
+	// shouldn't take the exporter down. We intentionally don't validate
+	// here so behaviour stays consistent with the upstream library.
+	enableCollectors := envList("PGX_ENABLE_COLLECTORS")
+	disableCollectors := envList("PGX_DISABLE_COLLECTORS")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
@@ -132,8 +154,10 @@ func main() {
 		// bundled Grafana dashboards in local/grafana/dashboards
 		// expect). Set PGX_METRIC_PREFIX=pg for postgres_exporter
 		// dashboard-name compatibility (pg_database_*, pg_bgwriter_*).
-		MetricPrefix: metricPrefix,
-		DBOpts:       dbOptsList,
+		MetricPrefix:       metricPrefix,
+		DBOpts:             dbOptsList,
+		EnabledCollectors:  enableCollectors,
+		DisabledCollectors: disableCollectors,
 	})
 	if err != nil {
 		log.Error("create exporter", "err", err)
@@ -216,6 +240,36 @@ func envDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envList parses a comma-separated env var into a deduplicated, order-
+// preserving list of non-empty values. Whitespace around entries is trimmed.
+// Unlike mustEnvList, missing/empty input returns nil rather than exiting —
+// this is the right shape for optional knobs like PGX_ENABLE_COLLECTORS,
+// where "unset" means "use library defaults".
+func envList(key string) []string {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func envIntDefault(log *slog.Logger, key string, fallback int) int {
