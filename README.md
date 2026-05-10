@@ -63,11 +63,7 @@ exporter will log a per-scrape error for each one. Disable them
 explicitly to keep logs clean:
 
 ```bash
-# Aurora writer (typical):
 PGX_DISABLE_COLLECTORS=wal_receiver,slru,subscription
-
-# Aurora reader (no replication state at all):
-PGX_DISABLE_COLLECTORS=wal_receiver,slru,subscription,replication,replication_slots
 ```
 
 `PGX_ENABLE_COLLECTORS` is the inverse knob — pin the running set to
