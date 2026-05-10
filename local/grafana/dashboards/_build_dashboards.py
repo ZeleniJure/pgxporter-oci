@@ -121,6 +121,12 @@ def row(pid, title, y) -> dict:
 
 
 def templating(extras: list[dict] | None = None) -> dict:
+    """Default templating: job / instance / datname filters.
+
+    `datname` is the *cluster-wide* label on pg_stat_database_* (one row per
+    database the cluster knows about, regardless of which pool we connected
+    through). Use this for dashboards that aggregate across pools.
+    """
     base = [
         {
             "current": {"text": "Prometheus", "value": "prometheus"},
@@ -592,6 +598,359 @@ def build_full() -> dict:
     )
 
 
+# --------------------------------------------------------------------------
+# Per-database dashboard — drill-down for a single Postgres database.
+# --------------------------------------------------------------------------
+# Now that pgxporter opens one pgxpool per entry in PGX_DB, every metric is
+# tagged with the connected database via the `database` label upstream. A
+# per-DB dashboard only makes sense on metrics that vary by database; the
+# truly cluster-wide ones (bgwriter / wal / checkpointer / archiver) are
+# emitted once per pool with identical values, so a per-DB view of those is
+# meaningless and we leave them to pgxporter-postgres.json.
+#
+# Two kinds of metrics show up here:
+#
+#   1. pg_stat_database_*  — has both `database` (pool) AND `datname` (the
+#      actual cluster row). When pool name == datname (the common case)
+#      these collapse; we filter by `datname` because that's the row we
+#      care about and it dedups across pools.
+#
+#   2. pg_stat_user_tables_*, pg_statio_user_*, pg_stat_user_indexes_* —
+#      per-DB views that only return rows for the connected database, so
+#      they only carry `database`. We filter by `database=~"$database"`.
+#
+# The dashboard's $database variable is sourced from
+# label_values(pg_stat_database_numbackends, datname) so it lists every
+# database any pool has visibility into (postgres, template1, template0,
+# plus whatever was in PGX_DB). The per-table panels will be empty for DBs
+# that aren't in PGX_DB — that's correct, not a bug.
+
+def database_templating() -> dict:
+    return {"list": [
+        {
+            "current": {"text": "Prometheus", "value": "prometheus"},
+            "hide": 0, "includeAll": False, "label": "Datasource",
+            "name": "DS_PROMETHEUS", "options": [], "query": "prometheus",
+            "refresh": 1, "regex": "", "skipUrlSync": False, "type": "datasource",
+        },
+        {
+            "current": {"text": "All", "value": "$__all"},
+            "datasource": DS,
+            "definition": "label_values(pg_stat_up, job)",
+            "hide": 0, "includeAll": True, "label": "job", "multi": True,
+            "name": "job", "options": [],
+            "query": {"query": "label_values(pg_stat_up, job)", "refId": "StandardVariableQuery"},
+            "refresh": 2, "regex": "", "skipUrlSync": False, "sort": 1, "type": "query",
+        },
+        {
+            "current": {"text": "All", "value": "$__all"},
+            "datasource": DS,
+            "definition": 'label_values(pg_stat_up{job=~"$job"}, instance)',
+            "hide": 0, "includeAll": True, "label": "instance", "multi": True,
+            "name": "instance", "options": [],
+            "query": {"query": 'label_values(pg_stat_up{job=~"$job"}, instance)',
+                      "refId": "StandardVariableQuery"},
+            "refresh": 2, "regex": "", "skipUrlSync": False, "sort": 1, "type": "query",
+        },
+        # Single-select. Defaults to the first non-template DB; the regex
+        # filters out template0/template1 noise.
+        {
+            "current": {"text": "appdb", "value": "appdb"},
+            "datasource": DS,
+            "definition": ('label_values(pg_stat_database_numbackends'
+                           '{job=~"$job", instance=~"$instance", datname!="", '
+                           'datname!~"template.*"}, datname)'),
+            "hide": 0, "includeAll": False, "label": "database", "multi": False,
+            "name": "database", "options": [],
+            "query": {"query": ('label_values(pg_stat_database_numbackends'
+                                '{job=~"$job", instance=~"$instance", datname!="", '
+                                'datname!~"template.*"}, datname)'),
+                      "refId": "StandardVariableQuery"},
+            "refresh": 2, "regex": "", "skipUrlSync": False, "sort": 1, "type": "query",
+        },
+    ]}
+
+
+def build_database() -> dict:
+    # Two selectors. SDB_ROW filters by `datname` for pg_stat_database_*
+    # (the cluster-wide row), SDB_POOL filters by `database` for views that
+    # only exist on the connected pool (per-table / per-index).
+    sdb_row = '{job=~"$job", instance=~"$instance", datname=~"$database"}'
+    sdb_pool = '{job=~"$job", instance=~"$instance", database=~"$database"}'
+
+    panels: list[dict] = []
+    pid = 1
+
+    # ---- Headline stats --------------------------------------------------
+    panels.append(stat(
+        pid, "Database", '1', gp=(0, 0, 4, 4),
+        thresholds={"mode": "absolute", "steps": [{"color": "blue", "value": None}]},
+        description="Selected database.",
+    ))
+    # Override the value display to show the variable name. Using a constant
+    # query + a value mapping is fiddly; instead overwrite the target.
+    panels[-1]["targets"] = [target('vector(1)', "$database", instant=True)]
+    panels[-1]["options"]["textMode"] = "name"
+    pid += 1
+
+    panels.append(stat(
+        pid, "Connections",
+        f'sum(pg_stat_database_numbackends{sdb_row})',
+        gp=(4, 0, 4, 4),
+        description="Backends currently connected to this database.",
+    ))
+    pid += 1
+    panels.append(stat(
+        pid, "Commits/s",
+        f'sum(rate(pg_stat_database_xact_commit_total{sdb_row}[$__rate_interval]))',
+        gp=(8, 0, 4, 4), unit="ops", decimals=1,
+    ))
+    pid += 1
+    panels.append(stat(
+        pid, "Rollbacks/s",
+        f'sum(rate(pg_stat_database_xact_rollback_total{sdb_row}[$__rate_interval]))',
+        gp=(12, 0, 4, 4), unit="ops", decimals=2,
+        thresholds={"mode": "absolute", "steps": [
+            {"color": "green", "value": None}, {"color": "yellow", "value": 1},
+            {"color": "red", "value": 10},
+        ]},
+    ))
+    pid += 1
+    panels.append(stat(
+        pid, "Cache Hit Ratio",
+        ('sum(rate(pg_stat_database_blks_hit_total' + sdb_row + '[5m])) / '
+         '(sum(rate(pg_stat_database_blks_hit_total' + sdb_row + '[5m])) '
+         '+ sum(rate(pg_stat_database_blks_read_total' + sdb_row + '[5m])))'),
+        gp=(16, 0, 4, 4), unit="percentunit", decimals=4, color_mode="background",
+        thresholds={"mode": "absolute", "steps": [
+            {"color": "red", "value": None}, {"color": "yellow", "value": 0.95},
+            {"color": "green", "value": 0.99},
+        ]},
+    ))
+    pid += 1
+    panels.append(stat(
+        pid, "Database size",
+        f'max(pg_database_size_bytes{sdb_row})',
+        gp=(20, 0, 4, 4), unit="bytes", decimals=2,
+    ))
+    pid += 1
+
+    # ---- Activity --------------------------------------------------------
+    panels.append(panel(
+        pid, "Transactions / sec",
+        [target(f'sum(rate(pg_stat_database_xact_commit_total{sdb_row}[$__rate_interval]))',
+                "commit", "A"),
+         target(f'sum(rate(pg_stat_database_xact_rollback_total{sdb_row}[$__rate_interval]))',
+                "rollback", "B")],
+        gp=(0, 4, 12, 8), unit="ops",
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Tuples / sec",
+        [target(f'sum(rate(pg_stat_database_tup_returned_total{sdb_row}[$__rate_interval]))', "returned", "A"),
+         target(f'sum(rate(pg_stat_database_tup_fetched_total{sdb_row}[$__rate_interval]))',  "fetched",  "B"),
+         target(f'sum(rate(pg_stat_database_tup_inserted_total{sdb_row}[$__rate_interval]))', "inserted", "C"),
+         target(f'sum(rate(pg_stat_database_tup_updated_total{sdb_row}[$__rate_interval]))',  "updated",  "D"),
+         target(f'sum(rate(pg_stat_database_tup_deleted_total{sdb_row}[$__rate_interval]))',  "deleted",  "E")],
+        gp=(12, 4, 12, 8), unit="ops",
+    ))
+    pid += 1
+
+    # ---- Time accounting (PG 14+) ---------------------------------------
+    # All four are CounterSeconds; rate() yields a unitless ratio (seconds
+    # of work per second of wall-clock = effective concurrency on that
+    # axis). Rendered as percentunit so 1.0 = "one backend fully busy".
+    panels.append(panel(
+        pid, "Effective concurrency by time category (PG 14+)",
+        [target(f'sum(rate(pg_stat_database_active_time_seconds_total{sdb_row}[$__rate_interval]))',
+                "active (executing query)", "A"),
+         target(f'sum(rate(pg_stat_database_idle_in_transaction_time_seconds_total{sdb_row}[$__rate_interval]))',
+                "idle in tx", "B"),
+         target(f'sum(rate(pg_stat_database_session_time_seconds_total{sdb_row}[$__rate_interval]))',
+                "session (total connected)", "C")],
+        gp=(0, 12, 12, 8), unit="percentunit", decimals=2,
+        description="Seconds of work per second of wall-clock. 1.0 = one backend continuously busy in that category. idle-in-tx > 0 sustained is the canonical 'app forgot to COMMIT/ROLLBACK' shape.",
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Block I/O time (seconds/sec)",
+        [target(f'sum(rate(pg_stat_database_blk_read_time_seconds_total{sdb_row}[$__rate_interval]))',
+                "read", "A"),
+         target(f'sum(rate(pg_stat_database_blk_write_time_seconds_total{sdb_row}[$__rate_interval]))',
+                "write", "B")],
+        gp=(12, 12, 12, 8), unit="percentunit", decimals=3,
+        description="Only populated when track_io_timing=on. Read+write summed across backends.",
+    ))
+    pid += 1
+
+    # ---- Cache & temp ----------------------------------------------------
+    panels.append(panel(
+        pid, "Block hits vs reads (rate)",
+        [target(f'sum(rate(pg_stat_database_blks_hit_total{sdb_row}[$__rate_interval]))',  "hits",  "A"),
+         target(f'sum(rate(pg_stat_database_blks_read_total{sdb_row}[$__rate_interval]))', "reads", "B")],
+        gp=(0, 20, 12, 8), unit="ops",
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Temp files / sec & temp bytes / sec",
+        [target(f'sum(rate(pg_stat_database_temp_files_total{sdb_row}[$__rate_interval]))', "temp files/s", "A"),
+         target(f'sum(rate(pg_stat_database_temp_bytes_total{sdb_row}[$__rate_interval]))', "temp bytes/s", "B")],
+        gp=(12, 20, 12, 8), unit="ops",
+        description="Non-zero indicates work_mem spilling — sort/hash that didn't fit memory.",
+    ))
+    pid += 1
+
+    # ---- Sessions / errors ----------------------------------------------
+    panels.append(panel(
+        pid, "Sessions / sec",
+        [target(f'sum(rate(pg_stat_database_sessions_total{sdb_row}[$__rate_interval]))',          "established", "A"),
+         target(f'sum(rate(pg_stat_database_sessions_abandoned_total{sdb_row}[$__rate_interval]))', "abandoned",   "B"),
+         target(f'sum(rate(pg_stat_database_sessions_fatal_total{sdb_row}[$__rate_interval]))',     "fatal",       "C"),
+         target(f'sum(rate(pg_stat_database_sessions_killed_total{sdb_row}[$__rate_interval]))',    "killed",      "D")],
+        gp=(0, 28, 12, 8), unit="ops",
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Deadlocks & conflicts (5m increase)",
+        [target(f'sum(increase(pg_stat_database_deadlocks_total{sdb_row}[5m]))', "deadlocks", "A"),
+         target(f'sum(increase(pg_stat_database_conflicts_total{sdb_row}[5m]))', "conflicts", "B")],
+        gp=(12, 28, 12, 8),
+    ))
+    pid += 1
+
+    # ---- Backends in this DB --------------------------------------------
+    # pg_stat_activity_count carries `datname` too (cluster-wide view), so
+    # filter that. backend_type lets you separate client backends from
+    # autovac/walwriter/etc.
+    panels.append(panel(
+        pid, "Backends by state (this DB)",
+        [target(f'sum by (state) (pg_stat_activity_count{sdb_row})', "{{state}}")],
+        gp=(0, 36, 12, 8),
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Backends by wait_event_type (this DB)",
+        [target(f'sum by (wait_event_type) (pg_stat_activity_count{sdb_row})',
+                "{{wait_event_type}}")],
+        gp=(12, 36, 12, 8),
+    ))
+    pid += 1
+
+    # ---- Per-table top-N -------------------------------------------------
+    # These views only have `database` — they don't carry datname, because
+    # the row IS scoped to the connected DB by definition. If $database
+    # isn't in PGX_DB these panels are empty (no pool to scrape from); the
+    # description on the row makes that explicit.
+    panels.append(row(pid, "Tables — must be a database in PGX_DB", 44))
+    pid += 1
+    panels.append(panel(
+        pid, "Top 10 tables by size proxy (live tuples)",
+        [target('topk(10, pg_stat_user_tables_n_live_tup' + sdb_pool + ')',
+                "{{schemaname}}.{{relname}}")],
+        gp=(0, 45, 12, 8),
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Top 10 tables by dead tuples",
+        [target('topk(10, pg_stat_user_tables_n_dead_tup' + sdb_pool + ')',
+                "{{schemaname}}.{{relname}}")],
+        gp=(12, 45, 12, 8),
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Top 10 tables by sequential-scan tuple reads /sec",
+        [target('topk(10, rate(pg_stat_user_tables_sequential_scan_tup_read' + sdb_pool + '[$__rate_interval]))',
+                "{{schemaname}}.{{relname}}")],
+        gp=(0, 53, 12, 8), unit="ops",
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Top 10 tables by inserts+updates+deletes /sec",
+        [target(('topk(10, '
+                 'rate(pg_stat_user_tables_n_tup_ins' + sdb_pool + '[$__rate_interval]) + '
+                 'rate(pg_stat_user_tables_n_tup_upd' + sdb_pool + '[$__rate_interval]) + '
+                 'rate(pg_stat_user_tables_n_tup_del' + sdb_pool + '[$__rate_interval]))'),
+                "{{schemaname}}.{{relname}}")],
+        gp=(12, 53, 12, 8), unit="ops",
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Top 10 tables by HOT-update ratio",
+        [target(('topk(10, '
+                 'rate(pg_stat_user_tables_n_tup_hot_upd' + sdb_pool + '[5m]) / '
+                 'clamp_min(rate(pg_stat_user_tables_n_tup_upd' + sdb_pool + '[5m]), 1))'),
+                "{{schemaname}}.{{relname}}")],
+        gp=(0, 61, 12, 8), unit="percentunit", decimals=3, min_=0, max_=1,
+        description="Higher is better. Low HOT ratio with high update rate ⇒ index bloat / fillfactor too high.",
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Time since last (auto)vacuum (seconds)",
+        [target(('time() - max by (schemaname, relname) '
+                 '(pg_stat_user_tables_last_autovacuum' + sdb_pool + ')'),
+                "autovacuum {{schemaname}}.{{relname}}", "A"),
+         target(('time() - max by (schemaname, relname) '
+                 '(pg_stat_user_tables_last_vacuum' + sdb_pool + ')'),
+                "vacuum {{schemaname}}.{{relname}}", "B")],
+        gp=(12, 61, 12, 8), unit="s",
+        description="A relentlessly-rising line on a high-churn table is the canonical autovacuum-can't-keep-up signal.",
+    ))
+    pid += 1
+
+    # ---- Per-table I/O ---------------------------------------------------
+    panels.append(panel(
+        pid, "Top 10 tables by heap block reads /sec (cache miss)",
+        [target('topk(10, rate(pg_statio_user_tables_heap_blks_read' + sdb_pool + '[$__rate_interval]))',
+                "{{schemaname}}.{{relname}}")],
+        gp=(0, 69, 12, 8), unit="ops",
+    ))
+    pid += 1
+    panels.append(panel(
+        pid, "Per-table heap cache hit ratio (top 10 by traffic)",
+        [target(('topk(10, '
+                 'rate(pg_statio_user_tables_heap_blks_hit' + sdb_pool + '[5m]) / '
+                 'clamp_min((rate(pg_statio_user_tables_heap_blks_hit' + sdb_pool + '[5m]) '
+                 '+ rate(pg_statio_user_tables_heap_blks_read' + sdb_pool + '[5m])), 1))'),
+                "{{schemaname}}.{{relname}}")],
+        gp=(12, 69, 12, 8), unit="percentunit", decimals=4, min_=0, max_=1,
+    ))
+    pid += 1
+
+    # ---- Per-index -------------------------------------------------------
+    panels.append(panel(
+        pid, "Top 10 indexes by scans /sec",
+        [target('topk(10, rate(pg_stat_user_indexes_index_scan' + sdb_pool + '[$__rate_interval]))',
+                "{{schemaname}}.{{relname}}.{{indexrelname}}")],
+        gp=(0, 77, 12, 8), unit="ops",
+    ))
+    pid += 1
+    # Index disuse: zero scans on an index in $__range is a candidate for
+    # DROP. The `unless` arm hides ones that are seeing scans now.
+    panels.append(panel(
+        pid, "Unused indexes (no scans in window)",
+        [target(('(pg_stat_user_indexes_index_scan' + sdb_pool + ' == 0) unless '
+                 'changes(pg_stat_user_indexes_index_scan' + sdb_pool + '[$__range]) > 0'),
+                "{{schemaname}}.{{relname}}.{{indexrelname}}")],
+        gp=(12, 77, 12, 8),
+        description="Indexes whose scan counter has not moved in the dashboard time range. Drop-candidate list.",
+        ptype="table",
+        options={"showHeader": True},
+    ))
+    pid += 1
+
+    d = dashboard(
+        uid="pgxporter-database",
+        title="pgxporter — Database (per-DB)",
+        description="Per-database deep-dive: activity, throughput, sessions, top-N tables and indexes for the selected database. Pair with 'pgxporter — Postgres' for cluster-wide subsystems.",
+        panels=panels,
+        time_from="now-1h",
+    )
+    # dashboard() injects the default datname-multiselect templating. This
+    # dashboard wants a single-select $database instead, so swap it in.
+    d["templating"] = database_templating()
+    return d
+
+
 def write(name, doc):
     path = HERE / name
     path.write_text(json.dumps(doc, indent=2) + "\n")
@@ -601,3 +960,4 @@ def write(name, doc):
 if __name__ == "__main__":
     write("pgxporter-overview.json", build_overview())
     write("pgxporter-postgres.json", build_full())
+    write("pgxporter-database.json", build_database())

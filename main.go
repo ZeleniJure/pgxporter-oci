@@ -12,13 +12,37 @@
 //     PGX_HOST     — Postgres host / RDS cluster endpoint
 //     PGX_PORT     — defaults to 5432
 //     PGX_USER     — Postgres role
-//     PGX_DB       — database to connect to
+//     PGX_DB       — comma-separated list of databases to connect to. The
+//     exporter opens an independent pgxpool per database and
+//     scrapes them concurrently. Cluster-wide views
+//     (pg_stat_bgwriter, pg_stat_activity, …) are tagged with
+//     current_database() upstream so labels don't collide; the
+//     reason for >1 entry is the per-database views
+//     (pg_stat[io]_user_tables, pg_stat[io]_user_indexes,
+//     pg_stat_progress_*) which only expose the *currently
+//     connected* database's rows. List every DB whose per-table
+//     metrics you care about.
 //     PGX_PASSWORD       — optional; if set, password auth is used instead of RDS IAM
 //     AWS_REGION         — required in IAM mode (SigV4 signing)
 //     LISTEN_ADDR        — defaults to ":9187"
 //     PGX_METRIC_PREFIX  — "pg_stat" (default, native pgxporter / modern names
 //     matching the bundled Grafana dashboards) or "pg"
 //     (postgres_exporter-compat: pg_database_*, pg_bgwriter_*, …)
+//     PGX_ENABLE_COLLECTORS  — optional, comma-separated. If set, restricts the
+//     running collector set to exactly these names; overrides the default-
+//     enabled set. Use to opt into collectors that are off by default
+//     (e.g. "statements", "settings", "subscription") without pulling in
+//     every other collector.
+//     PGX_DISABLE_COLLECTORS — optional, comma-separated. Subtracted from the
+//     resolved collector set after PGX_ENABLE_COLLECTORS, so a name in
+//     both lists ends up disabled. Use on managed Postgres flavours that
+//     restrict access to certain views — Aurora notably hides
+//     pg_stat_wal_receiver, pg_stat_replication on the writer, the SLRU
+//     view, and a few others; setting e.g.
+//     PGX_DISABLE_COLLECTORS=wal_receiver,slru,subscription silences the
+//     resulting scrape errors. Unknown names are logged and ignored.
+//     See https://pkg.go.dev/github.com/becomeliminal/pgxporter/exporter/collectors
+//     for the full list of collector names.
 package main
 
 import (
@@ -29,6 +53,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -54,7 +79,7 @@ func main() {
 
 	host := mustEnv(log, "PGX_HOST")
 	user := mustEnv(log, "PGX_USER")
-	database := mustEnv(log, "PGX_DB")
+	databases := mustEnvList(log, "PGX_DB")
 	port := envIntDefault(log, "PGX_PORT", defaultPort)
 	listenAddr := envDefault("LISTEN_ADDR", defaultListenAddr)
 	password := os.Getenv("PGX_PASSWORD")
@@ -63,35 +88,25 @@ func main() {
 		log.Error("invalid PGX_METRIC_PREFIX", "err", err)
 		os.Exit(2)
 	}
+	// Collector enable/disable lists are optional. Validation (unknown
+	// names) happens inside collectors.ResolveCollectors, which logs and
+	// ignores unknown entries rather than aborting — typo-on-deploy
+	// shouldn't take the exporter down. We intentionally don't validate
+	// here so behaviour stays consistent with the upstream library.
+	enableCollectors := envList("PGX_ENABLE_COLLECTORS")
+	disableCollectors := envList("PGX_DISABLE_COLLECTORS")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	dbOpts := db.Opts{
-		Host:            host,
-		Port:            port,
-		User:            user,
-		Database:        database,
-		ApplicationName: "pgxporter",
-		// The library's struct-tag defaults are only applied when its
-		// flag/env parser is used; constructing Opts directly leaves
-		// these at zero, which pgxpool either rejects (pool_max_conns)
-		// or panics on (pool_health_check_period -> NewTicker(0)).
-		PoolMaxConns:          2,
-		PoolMinConns:          0,
-		PoolMaxConnIdleTime:   30 * time.Minute,
-		PoolHealthCheckPeriod: time.Minute,
-	}
-
+	// Auth is configured once and shared across every per-database pool:
+	// password mode reuses the same static password, IAM mode reuses a
+	// single AuthProvider (one AWS SDK client, one credential chain) that
+	// mints tokens per-connection regardless of target database.
+	var authProvider *awsrds.Provider
 	if password != "" {
-		// Password mode: local dev or non-RDS deployments. AWS_REGION is
-		// not consulted; pgxpool uses the static password directly.
 		log.Info("auth mode: password")
-		dbOpts.Password = password
 	} else {
-		// IAM mode: mint a fresh SigV4-signed token per connection via
-		// pgx's BeforeConnect hook. Pool connections are rotated under
-		// the 15-minute token TTL.
 		region := mustEnv(log, "AWS_REGION")
 		log.Info("auth mode: rds-iam", "region", region)
 		provider, err := awsrds.NewDefault(ctx, region)
@@ -99,8 +114,38 @@ func main() {
 			log.Error("init AWS RDS auth provider", "err", err)
 			os.Exit(1)
 		}
-		dbOpts.AuthProvider = provider
-		dbOpts.PoolMaxConnLifetime = poolConnLifetime
+		authProvider = provider
+	}
+
+	dbOptsList := make([]db.Opts, 0, len(databases))
+	for _, database := range databases {
+		opts := db.Opts{
+			Host:            host,
+			Port:            port,
+			User:            user,
+			Database:        database,
+			ApplicationName: "pgxporter",
+			// The library's struct-tag defaults are only applied when its
+			// flag/env parser is used; constructing Opts directly leaves
+			// these at zero, which pgxpool either rejects (pool_max_conns)
+			// or panics on (pool_health_check_period -> NewTicker(0)).
+			PoolMaxConns:          2,
+			PoolMinConns:          0,
+			PoolMaxConnIdleTime:   30 * time.Minute,
+			PoolHealthCheckPeriod: time.Minute,
+		}
+		if password != "" {
+			// Password mode: local dev or non-RDS deployments. AWS_REGION is
+			// not consulted; pgxpool uses the static password directly.
+			opts.Password = password
+		} else {
+			// IAM mode: mint a fresh SigV4-signed token per connection via
+			// pgx's BeforeConnect hook. Pool connections are rotated under
+			// the 15-minute token TTL.
+			opts.AuthProvider = authProvider
+			opts.PoolMaxConnLifetime = poolConnLifetime
+		}
+		dbOptsList = append(dbOptsList, opts)
 	}
 
 	exp, err := exporter.New(ctx, exporter.Opts{
@@ -109,8 +154,10 @@ func main() {
 		// bundled Grafana dashboards in local/grafana/dashboards
 		// expect). Set PGX_METRIC_PREFIX=pg for postgres_exporter
 		// dashboard-name compatibility (pg_database_*, pg_bgwriter_*).
-		MetricPrefix: metricPrefix,
-		DBOpts:       []db.Opts{dbOpts},
+		MetricPrefix:       metricPrefix,
+		DBOpts:             dbOptsList,
+		EnabledCollectors:  enableCollectors,
+		DisabledCollectors: disableCollectors,
 	})
 	if err != nil {
 		log.Error("create exporter", "err", err)
@@ -131,7 +178,7 @@ func main() {
 	}
 
 	go func() {
-		log.Info("listening", "addr", listenAddr, "host", host, "user", user, "db", database)
+		log.Info("listening", "addr", listenAddr, "host", host, "user", user, "dbs", databases)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http listen", "err", err)
 			cancel()
@@ -161,11 +208,68 @@ func mustEnv(log *slog.Logger, key string) string {
 	return v
 }
 
+// mustEnvList parses a comma-separated env var into a deduplicated, order-
+// preserving list of non-empty values. Whitespace around entries is trimmed
+// so `PGX_DB=appdb, analytics ,reporting` works the obvious way. Exits if
+// the variable is missing or yields zero entries.
+func mustEnvList(log *slog.Logger, key string) []string {
+	raw := mustEnv(log, key)
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		log.Error("env var has no non-empty entries", "key", key, "value", raw)
+		os.Exit(2)
+	}
+	return out
+}
+
 func envDefault(key, fallback string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
 	}
 	return fallback
+}
+
+// envList parses a comma-separated env var into a deduplicated, order-
+// preserving list of non-empty values. Whitespace around entries is trimmed.
+// Unlike mustEnvList, missing/empty input returns nil rather than exiting —
+// this is the right shape for optional knobs like PGX_ENABLE_COLLECTORS,
+// where "unset" means "use library defaults".
+func envList(key string) []string {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func envIntDefault(log *slog.Logger, key string, fallback int) int {
