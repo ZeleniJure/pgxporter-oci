@@ -13,7 +13,7 @@ Environment variables (no flags, no config file):
 | `PGX_HOST`   | yes      |         | RDS endpoint (writer or reader) |
 | `PGX_PORT`   | no       | `5432`  | |
 | `PGX_USER`   | yes      |         | Postgres role. In IAM mode it must have `GRANT rds_iam`. |
-| `PGX_DB`     | yes      |         | e.g. `yeet` |
+| `PGX_DB`     | yes      |         | Comma-separated list of databases (e.g. `appdb` or `appdb,analytics`). One pgxpool is opened per database; cluster-wide views are only collected once (rows are tagged with `current_database()` so labels don't collide), but per-database views (`pg_stat[io]_user_tables`, `pg_stat[io]_user_indexes`, `pg_stat_progress_*`) are scoped to the connected DB and so are only emitted for the databases you list here. |
 | `PGX_PASSWORD` | no     |         | If set, password auth is used and AWS is **not** consulted. Intended for local dev / non-RDS deployments. |
 | `AWS_REGION` | conditional |      | Required in IAM mode (when `PGX_PASSWORD` is empty). Used for SigV4 token signing. |
 | `LISTEN_ADDR`| no       | `:9187` | |

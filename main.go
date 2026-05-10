@@ -12,7 +12,16 @@
 //     PGX_HOST     — Postgres host / RDS cluster endpoint
 //     PGX_PORT     — defaults to 5432
 //     PGX_USER     — Postgres role
-//     PGX_DB       — database to connect to
+//     PGX_DB       — comma-separated list of databases to connect to. The
+//     exporter opens an independent pgxpool per database and
+//     scrapes them concurrently. Cluster-wide views
+//     (pg_stat_bgwriter, pg_stat_activity, …) are tagged with
+//     current_database() upstream so labels don't collide; the
+//     reason for >1 entry is the per-database views
+//     (pg_stat[io]_user_tables, pg_stat[io]_user_indexes,
+//     pg_stat_progress_*) which only expose the *currently
+//     connected* database's rows. List every DB whose per-table
+//     metrics you care about.
 //     PGX_PASSWORD       — optional; if set, password auth is used instead of RDS IAM
 //     AWS_REGION         — required in IAM mode (SigV4 signing)
 //     LISTEN_ADDR        — defaults to ":9187"
@@ -29,6 +38,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -54,7 +64,7 @@ func main() {
 
 	host := mustEnv(log, "PGX_HOST")
 	user := mustEnv(log, "PGX_USER")
-	database := mustEnv(log, "PGX_DB")
+	databases := mustEnvList(log, "PGX_DB")
 	port := envIntDefault(log, "PGX_PORT", defaultPort)
 	listenAddr := envDefault("LISTEN_ADDR", defaultListenAddr)
 	password := os.Getenv("PGX_PASSWORD")
@@ -67,31 +77,14 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	dbOpts := db.Opts{
-		Host:            host,
-		Port:            port,
-		User:            user,
-		Database:        database,
-		ApplicationName: "pgxporter",
-		// The library's struct-tag defaults are only applied when its
-		// flag/env parser is used; constructing Opts directly leaves
-		// these at zero, which pgxpool either rejects (pool_max_conns)
-		// or panics on (pool_health_check_period -> NewTicker(0)).
-		PoolMaxConns:          2,
-		PoolMinConns:          0,
-		PoolMaxConnIdleTime:   30 * time.Minute,
-		PoolHealthCheckPeriod: time.Minute,
-	}
-
+	// Auth is configured once and shared across every per-database pool:
+	// password mode reuses the same static password, IAM mode reuses a
+	// single AuthProvider (one AWS SDK client, one credential chain) that
+	// mints tokens per-connection regardless of target database.
+	var authProvider *awsrds.Provider
 	if password != "" {
-		// Password mode: local dev or non-RDS deployments. AWS_REGION is
-		// not consulted; pgxpool uses the static password directly.
 		log.Info("auth mode: password")
-		dbOpts.Password = password
 	} else {
-		// IAM mode: mint a fresh SigV4-signed token per connection via
-		// pgx's BeforeConnect hook. Pool connections are rotated under
-		// the 15-minute token TTL.
 		region := mustEnv(log, "AWS_REGION")
 		log.Info("auth mode: rds-iam", "region", region)
 		provider, err := awsrds.NewDefault(ctx, region)
@@ -99,8 +92,38 @@ func main() {
 			log.Error("init AWS RDS auth provider", "err", err)
 			os.Exit(1)
 		}
-		dbOpts.AuthProvider = provider
-		dbOpts.PoolMaxConnLifetime = poolConnLifetime
+		authProvider = provider
+	}
+
+	dbOptsList := make([]db.Opts, 0, len(databases))
+	for _, database := range databases {
+		opts := db.Opts{
+			Host:            host,
+			Port:            port,
+			User:            user,
+			Database:        database,
+			ApplicationName: "pgxporter",
+			// The library's struct-tag defaults are only applied when its
+			// flag/env parser is used; constructing Opts directly leaves
+			// these at zero, which pgxpool either rejects (pool_max_conns)
+			// or panics on (pool_health_check_period -> NewTicker(0)).
+			PoolMaxConns:          2,
+			PoolMinConns:          0,
+			PoolMaxConnIdleTime:   30 * time.Minute,
+			PoolHealthCheckPeriod: time.Minute,
+		}
+		if password != "" {
+			// Password mode: local dev or non-RDS deployments. AWS_REGION is
+			// not consulted; pgxpool uses the static password directly.
+			opts.Password = password
+		} else {
+			// IAM mode: mint a fresh SigV4-signed token per connection via
+			// pgx's BeforeConnect hook. Pool connections are rotated under
+			// the 15-minute token TTL.
+			opts.AuthProvider = authProvider
+			opts.PoolMaxConnLifetime = poolConnLifetime
+		}
+		dbOptsList = append(dbOptsList, opts)
 	}
 
 	exp, err := exporter.New(ctx, exporter.Opts{
@@ -110,7 +133,7 @@ func main() {
 		// expect). Set PGX_METRIC_PREFIX=pg for postgres_exporter
 		// dashboard-name compatibility (pg_database_*, pg_bgwriter_*).
 		MetricPrefix: metricPrefix,
-		DBOpts:       []db.Opts{dbOpts},
+		DBOpts:       dbOptsList,
 	})
 	if err != nil {
 		log.Error("create exporter", "err", err)
@@ -131,7 +154,7 @@ func main() {
 	}
 
 	go func() {
-		log.Info("listening", "addr", listenAddr, "host", host, "user", user, "db", database)
+		log.Info("listening", "addr", listenAddr, "host", host, "user", user, "dbs", databases)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http listen", "err", err)
 			cancel()
@@ -159,6 +182,33 @@ func mustEnv(log *slog.Logger, key string) string {
 		os.Exit(2)
 	}
 	return v
+}
+
+// mustEnvList parses a comma-separated env var into a deduplicated, order-
+// preserving list of non-empty values. Whitespace around entries is trimmed
+// so `PGX_DB=appdb, analytics ,reporting` works the obvious way. Exits if
+// the variable is missing or yields zero entries.
+func mustEnvList(log *slog.Logger, key string) []string {
+	raw := mustEnv(log, key)
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		log.Error("env var has no non-empty entries", "key", key, "value", raw)
+		os.Exit(2)
+	}
+	return out
 }
 
 func envDefault(key, fallback string) string {
