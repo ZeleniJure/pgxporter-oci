@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.25-trixie AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-trixie AS build
 WORKDIR /src
 
 COPY go.mod go.sum* ./
